@@ -1,7 +1,36 @@
 defmodule Serum.StructValidator do
   @moduledoc false
 
-  @type result() :: :ok | {:invalid, binary()} | {:invalid, [binary()]}
+  require Serum.V2.Result, as: Result
+  alias Serum.ForeignCode
+  alias Serum.V2.Error
+
+  def_validate_expr =
+    quote unquote: false do
+      @spec validate(term()) :: Result.t({})
+      def validate(term) do
+        unquote(used_module)._validate(
+          term,
+          __MODULE__,
+          unquote(all_keys),
+          unquote(required_keys)
+        )
+      end
+    end
+
+  def_validate_field_expr =
+    quote unquote: false do
+      def _validate_field(unquote(name), var!(value)) do
+        if unquote(check_expr) do
+          :ok
+        else
+          {:fail, unquote(check_str)}
+        end
+      end
+    end
+
+  @def_validate_expr def_validate_expr
+  @def_validate_field_expr def_validate_field_expr
 
   @spec __using__(term()) :: Macro.t()
   defmacro __using__(_opts) do
@@ -12,35 +41,7 @@ defmodule Serum.StructValidator do
 
   @spec define_validator(keyword()) :: Macro.t()
   defmacro define_validator(do: do_block) do
-    exprs =
-      case do_block do
-        {:__block__, _, exprs} when is_list(exprs) -> exprs
-        expr -> [expr]
-      end
-
-    def_validate_expr =
-      quote unquote: false do
-        @spec validate(term()) :: unquote(used_module).result()
-        def validate(term) do
-          unquote(used_module)._validate(
-            term,
-            __MODULE__,
-            unquote(all_keys),
-            unquote(required_keys)
-          )
-        end
-      end
-
-    def_validate_field_expr =
-      quote unquote: false do
-        def _validate_field(unquote(name), var!(value)) do
-          if unquote(check_expr) do
-            :ok
-          else
-            {:fail, unquote(check_str)}
-          end
-        end
-      end
+    exprs = extract_block(do_block)
 
     quote do
       import unquote(__MODULE__), only: [key: 2]
@@ -56,7 +57,7 @@ defmodule Serum.StructValidator do
         |> MapSet.new()
         |> Macro.escape()
 
-      unquote(def_validate_expr)
+      unquote(@def_validate_expr)
 
       @spec _validate_field(atom(), term()) :: :ok | {:fail, binary()}
       def _validate_field(key, value)
@@ -81,7 +82,7 @@ defmodule Serum.StructValidator do
           |> Enum.reduce(&quote(do: unquote(&2) and unquote(&1)))
           |> Macro.to_string()
 
-        unquote(def_validate_field_expr)
+        unquote(@def_validate_field_expr)
       end)
     end
   end
@@ -89,86 +90,89 @@ defmodule Serum.StructValidator do
   @spec key(atom(), keyword()) :: Macro.t()
   defmacro key(name, opts), do: quote(do: {unquote(name), unquote(opts)})
 
+  @spec extract_block(Macro.t()) :: [Macro.t()]
+  defp extract_block(maybe_block_expr)
+  defp extract_block({:__block__, _, exprs}) when is_list(exprs), do: exprs
+  defp extract_block(expr), do: [expr]
+
   @doc false
-  @spec _validate(term(), module(), term(), term()) :: result()
-  def _validate(value, module, all_keys, required_keys)
+  @spec _validate(term(), module(), term(), term()) :: Result.t({})
+  def _validate(value, module, all_keys, required_keys) do
+    module_name = ForeignCode.module_name(module)
+    fail_message = "validation for #{module_name} struct failed:"
 
-  def _validate(%{} = map, module, all_keys, required_keys) do
-    keys = map |> Map.keys() |> MapSet.new()
+    value
+    |> do_validate(module, all_keys, required_keys)
+    |> case do
+      {:ok, _} = ok_result ->
+        ok_result
 
-    with {:missing, []} <- check_missing_keys(keys, required_keys),
-         {:extra, []} <- check_extra_keys(keys, all_keys),
-         :ok <- check_constraints(map, module) do
-      :ok
-    else
-      {:missing, [x]} ->
-        {:invalid, "missing required property: #{x}"}
-
-      {:missing, xs} ->
-        props_str = Enum.join(xs, ", ")
-
-        {:invalid, "missing required properties: #{props_str}"}
-
-      {:extra, [x]} ->
-        {:invalid, "unknown property: #{x}"}
-
-      {:extra, xs} ->
-        props_str = Enum.join(xs, ", ")
-
-        {:invalid, "unknown properties: #{props_str}"}
-
-      {:error, messages} ->
-        {:invalid, messages}
+      {:error, %Error{caused_by: errors} = error} ->
+        Result.fail(
+          Simple: [fail_message],
+          caused_by: if(Enum.empty?(errors), do: [error], else: errors)
+        )
     end
   end
 
-  def _validate(term, _module, _all_keys, _required_keys) do
-    {:invalid, "expected a map, got: #{inspect(term)}"}
+  @spec do_validate(term(), module(), term(), term()) :: Result.t({})
+  defp do_validate(term, module, all_keys, required_keys)
+
+  defp do_validate(%{} = map, module, all_keys, required_keys) do
+    keys = map |> Map.keys() |> MapSet.new()
+
+    Result.run do
+      compare_key_sets(required_keys, keys, "missing required")
+      compare_key_sets(keys, all_keys, "unknown")
+      check_constraints(map, module)
+    end
   end
 
-  @spec check_missing_keys(term(), term()) :: {:missing, [atom()]}
-  defp check_missing_keys(keys, required_keys) do
-    missing =
-      required_keys
-      |> MapSet.difference(keys)
-      |> MapSet.to_list()
-
-    {:missing, missing}
+  defp do_validate(term, _module, _all_keys, _required_keys) do
+    Result.fail(Simple: ["expected a map, got: #{inspect(term)}"])
   end
 
-  @spec check_extra_keys(term(), term()) :: {:extra, [atom()]}
-  defp check_extra_keys(keys, all_keys) do
-    extra =
-      keys
-      |> MapSet.difference(all_keys)
-      |> MapSet.to_list()
+  @spec compare_key_sets(term(), term(), binary()) :: Result.t({})
+  defp compare_key_sets(keys1, keys2, message_prefix) do
+    keys1
+    |> MapSet.difference(keys2)
+    |> MapSet.to_list()
+    |> case do
+      [] ->
+        Result.return()
 
-    {:extra, extra}
+      difference when is_list(difference) ->
+        prop_word = pluralize_property(difference)
+        keys_str = Enum.join(difference, ", ")
+
+        Result.fail(Simple: ["#{message_prefix} #{prop_word}: #{keys_str}"])
+    end
   end
 
-  @spec check_constraints(map(), module()) :: :ok | {:error, [binary()]}
+  @spec check_constraints(map(), module()) :: Result.t({})
   defp check_constraints(map, module) do
     map
     |> Enum.map(fn {k, v} -> {k, module._validate_field(k, v)} end)
     |> Enum.filter(&(elem(&1, 1) != :ok))
+    |> Enum.map(fn {k, {:fail, s}} ->
+      [
+        "the property ",
+        [:bright, :yellow, to_string(k), :reset],
+        " violates the constraint ",
+        [:bright, :yellow, s, :reset]
+      ]
+      |> IO.ANSI.format()
+      |> IO.iodata_to_binary()
+    end)
+    |> Enum.map(&Result.fail(Simple: [&1]))
     |> case do
-      [] ->
-        :ok
-
-      errors ->
-        messages =
-          Enum.map(errors, fn {k, {:fail, s}} ->
-            [
-              "the property ",
-              [:bright, :yellow, to_string(k), :reset],
-              " violates the constraint ",
-              [:bright, :yellow, s, :reset]
-            ]
-            |> IO.ANSI.format()
-            |> IO.iodata_to_binary()
-          end)
-
-        {:error, messages}
+      [] -> Result.return()
+      errors -> Result.aggregate(errors, "")
     end
   end
+
+  @spec pluralize_property(list()) :: binary()
+  defp pluralize_property(list)
+  defp pluralize_property([_]), do: "property"
+  defp pluralize_property([_ | _]), do: "properties"
 end

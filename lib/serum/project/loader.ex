@@ -39,34 +39,19 @@ defmodule Serum.Project.Loader do
 
     Result.run do
       file <- V2.File.read(exs_file)
-      proj <- load_exs(file)
+      value <- eval_file(file)
+      ElixirValidator.validate(value)
 
-      Result.return(proj)
+      value |> Project.new() |> Result.return()
     end
   end
 
-  @spec load_exs(V2.File.t()) :: Result.t(Project.t())
-  defp load_exs(file) do
-    with {map, _} <- Code.eval_string(file.in_data, [], file: file.src),
-         :ok <- ElixirValidator.validate(map) do
-      map |> Project.new() |> Result.return()
-    else
-      # From File.read/1:
-      {:error, reason} when is_atom(reason) ->
-        Result.fail(POSIX: [reason], file: file)
-
-      # From ElixirValidator.validate/2:
-      {:invalid, message} when is_binary(message) ->
-        Result.fail(Simple: [message], file: file)
-
-      {:invalid, messages} when is_list(messages) ->
-        errors =
-          Enum.map(messages, fn message ->
-            Result.fail(Simple: [message], file: file)
-          end)
-
-        Result.aggregate(errors, "failed to validate `serum.exs`:")
-    end
+  @spec eval_file(V2.File.t()) :: Result.t(term())
+  defp eval_file(file) do
+    file.in_data
+    |> Code.eval_string([], file: file.src)
+    |> elem(0)
+    |> Result.return()
   rescue
     e in [CompileError, SyntaxError, TokenMissingError] ->
       Result.fail(Exception: [e, __STACKTRACE__], file: file, line: e.line)
