@@ -20,11 +20,11 @@ defmodule Serum.StructValidator do
 
   def_validate_field_expr =
     quote unquote: false do
-      def _validate_field(unquote(name), var!(value)) do
+      def _validate_field(unquote(name) = name, var!(value)) do
         if unquote(check_expr) do
-          :ok
+          Result.return()
         else
-          {:fail, unquote(check_str)}
+          Result.fail(Constraint: [name, var!(value), unquote(check_str)])
         end
       end
     end
@@ -35,6 +35,7 @@ defmodule Serum.StructValidator do
   @spec __using__(term()) :: Macro.t()
   defmacro __using__(_opts) do
     quote do
+      require Serum.V2.Result, as: Result
       import unquote(__MODULE__), only: [define_validator: 1]
     end
   end
@@ -59,7 +60,7 @@ defmodule Serum.StructValidator do
 
       unquote(@def_validate_expr)
 
-      @spec _validate_field(atom(), term()) :: :ok | {:fail, binary()}
+      @spec _validate_field(atom(), term()) :: Result.t({})
       def _validate_field(key, value)
 
       Enum.map(key_specs, fn {name, opts} ->
@@ -124,7 +125,10 @@ defmodule Serum.StructValidator do
     Result.run do
       compare_key_sets(required_keys, keys, "missing required")
       compare_key_sets(keys, all_keys, "unknown")
-      check_constraints(map, module)
+
+      map
+      |> Enum.map(fn {key, value} -> module._validate_field(key, value) end)
+      |> Result.aggregate("")
     end
   end
 
@@ -146,28 +150,6 @@ defmodule Serum.StructValidator do
         keys_str = Enum.join(difference, ", ")
 
         Result.fail(Simple: ["#{message_prefix} #{prop_word}: #{keys_str}"])
-    end
-  end
-
-  @spec check_constraints(map(), module()) :: Result.t({})
-  defp check_constraints(map, module) do
-    map
-    |> Enum.map(fn {k, v} -> {k, module._validate_field(k, v)} end)
-    |> Enum.filter(&(elem(&1, 1) != :ok))
-    |> Enum.map(fn {k, {:fail, s}} ->
-      [
-        "the property ",
-        [:bright, :yellow, to_string(k), :reset],
-        " violates the constraint ",
-        [:bright, :yellow, s, :reset]
-      ]
-      |> IO.ANSI.format()
-      |> IO.iodata_to_binary()
-    end)
-    |> Enum.map(&Result.fail(Simple: [&1]))
-    |> case do
-      [] -> Result.return()
-      errors -> Result.aggregate(errors, "")
     end
   end
 
